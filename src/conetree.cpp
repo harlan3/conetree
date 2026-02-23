@@ -67,7 +67,7 @@ Node* parseMM(const string &filename) {
 			Node *newNode = new Node();
 			newNode->text =
 					child->Attribute("TEXT") ? child->Attribute("TEXT") : "";
-			node->children.push_back(newNode);
+			node->children.insert(node->children.begin(), std::move(newNode));
 			self(self, child, newNode);
 		}
 	};
