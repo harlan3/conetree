@@ -1,20 +1,10 @@
-/*
-BSD 2-Clause "Simplified" License
-Copyright (c) 2026 Harlan Murphy
-
-Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
-2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
 
 #include <GL/glut.h>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <cmath>
+#include <algorithm>
 #include "tinyxml2.h"
 
 using namespace std;
@@ -43,6 +33,48 @@ int button;
 float panX = 0.0f;
 float panY = 0.0f;
 bool fullScreen;
+
+// Cone selection/animation
+// - selectedConeIndex == -1 : ALL cones are selected
+// - selectedConeIndex >= 0  : only that cone index is selected (draw-order index)
+int selectedConeIndex = -1;
+float coneSpinAllDeg = 0.0f;
+float coneSpinSingleDeg = 0.0f;
+float animationSpeed = 1.0f; // 1.0 = normal speed
+int totalCones = 0;
+
+static int countCones(const Node *n) {
+	if (!n)
+		return 0;
+	int c = (n->children.empty() ? 0 : 1);
+	for (auto ch : n->children)
+		c += countCones(ch);
+	return c;
+}
+
+static Pos rotateOffsetAroundConeAxis(const Pos &offset, float deg, bool vertical) {
+	// vertical: rotate around Y axis (X/Z plane)
+	// horizontal: rotate around X axis (Y/Z plane)
+	float r = deg * (float)M_PI / 180.0f;
+	float c = cosf(r);
+	float s = sinf(r);
+
+	Pos out = offset;
+
+	if (vertical) {
+		// rotate (x,z)
+		out.x = offset.x * c - offset.z * s;
+		out.z = offset.x * s + offset.z * c;
+		// y unchanged
+	} else {
+		// rotate (y,z) around X
+		out.y = offset.y * c - offset.z * s;
+		out.z = offset.y * s + offset.z * c;
+		// x unchanged
+	}
+
+	return out;
+}
 
 Node* parseMM(const string &filename) {
 
@@ -181,24 +213,50 @@ void deleteTree(Node *node) {
 	delete node;
 }
 
-void drawNode(const Node *node) {
+void drawNodeAt(const Node *node, const Pos &p) {
 
+	// ----- Draw sphere normally (3D depth tested) -----
 	glPushMatrix();
-	glTranslatef(node->pos.x, node->pos.y, node->pos.z);
+	glTranslatef(p.x, p.y, p.z);
+
 	glColor3f(0.0f, 0.0f, 1.0f);
 	glutSolidSphere(0.2f, 10, 10);
 
-	// Draw text (simple, may not be perfectly oriented)
+	glPopMatrix();
+
+	// ----- Draw billboarded text ALWAYS visible -----
+	glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT);
+
+	// Disable depth so text is never hidden
+	glDisable(GL_DEPTH_TEST);
+	glDepthMask(GL_FALSE);
+
+	glPushMatrix();
+	glTranslatef(p.x, p.y, p.z);
+
+	// Cancel scene rotations (billboard)
+	// display() does: RotateX(rot_x) then RotateY(rot_y)
+	// To undo, apply inverse in reverse order:
+	glRotatef(-rot_y, 0.0f, 1.0f, 0.0f);
+	glRotatef(-rot_x, 1.0f, 0.0f, 0.0f);
+
 	glColor3f(1.0f, 1.0f, 1.0f);
-	glRasterPos3f(0.3f, 0.0f, 0.0f);
+	glRasterPos3f(0.35f, 0.0f, 0.0f);
+
 	for (char c : node->text) {
 		glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
 	}
+
 	glPopMatrix();
+
+	// Restore depth settings
+	glDepthMask(GL_TRUE);
+	glPopAttrib();
 }
 
+
 void drawCone(const Pos &parent_pos, const Pos &base_center, float radius,
-		float height, bool vertical) {
+		float height, bool vertical, bool selected, float spinDeg) {
 
 	glPushMatrix();
 
@@ -208,20 +266,27 @@ void drawCone(const Pos &parent_pos, const Pos &base_center, float radius,
 	// Cone shading
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glColor4f(0.15f, 0.55f, 1.00f, 0.52f);
+	if (selected) {
+		glColor4f(0.20f, 1.00f, 0.35f, 0.70f);
+	} else {
+		glColor4f(0.15f, 0.55f, 1.00f, 0.40f);
+	}
 
 	GLUquadric *quad = gluNewQuadric();
 	gluQuadricDrawStyle(quad, GLU_FILL);
 	gluQuadricNormals(quad, GLU_SMOOTH);
 
+	// Orient so cylinder axis matches the tree axis, then spin about that axis.
 	if (vertical) {
 		glRotatef(90.0f, 1.0f, 0.0f, 0.0f);
 		glRotatef(180.0f, 0.0f, 0.0f, 1.0f);
-		glColor4f(0.15f, 0.55f, 1.00f, 0.52f);
+		if (spinDeg != 0.0f)
+			glRotatef(spinDeg, 0.0f, 0.0f, 1.0f);
 		gluCylinder(quad, 0.0f, radius, height, 32, 1);
 	} else {
 		glRotatef(90.0f, 0.0f, 1.0f, 0.0f);
-		glColor4f(0.15f, 0.55f, 1.00f, 0.52f);
+		if (spinDeg != 0.0f)
+			glRotatef(spinDeg, 0.0f, 0.0f, 1.0f);
 		gluCylinder(quad, 0.0f, radius, height, 32, 1);
 	}
 
@@ -231,55 +296,91 @@ void drawCone(const Pos &parent_pos, const Pos &base_center, float radius,
 	glDisable(GL_BLEND);
 
 	// Wireframe
-	glColor3f(0.4f, 0.7f, 1.0f);
 	glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 	glLineWidth(1.2f);
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glColor4f(0.4f, 0.8f, 1.0f, 0.7f);
+	if (selected)
+		glColor4f(0.30f, 1.00f, 0.45f, 0.95f);
+	else
+		glColor4f(0.4f, 0.8f, 1.0f, 0.7f);
 
 	GLUquadric *quad_wire = gluNewQuadric();
+	glPushMatrix();
+	glTranslatef(parent_pos.x, parent_pos.y, parent_pos.z);
 	if (vertical) {
-		glPushMatrix();
-		glTranslatef(parent_pos.x, parent_pos.y, parent_pos.z);
 		glRotatef(90.0f, 1.0f, 0.0f, 0.0f);
 		glRotatef(180.0f, 0.0f, 0.0f, 1.0f);
-		gluCylinder(quad_wire, 0.0, radius, height, 32, 1);
-		glPopMatrix();
+		if (spinDeg != 0.0f)
+			glRotatef(spinDeg, 0.0f, 0.0f, 1.0f);
 	} else {
-		glPushMatrix();
-		glTranslatef(parent_pos.x, parent_pos.y, parent_pos.z);
 		glRotatef(90.0f, 0.0f, 1.0f, 0.0f);
-		gluCylinder(quad_wire, 0.0, radius, height, 32, 1);
-		glPopMatrix();
+		if (spinDeg != 0.0f)
+			glRotatef(spinDeg, 0.0f, 0.0f, 1.0f);
 	}
+	gluCylinder(quad_wire, 0.0, radius, height, 32, 1);
+	glPopMatrix();
 	gluDeleteQuadric(quad_wire);
+
 	glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 	glDisable(GL_BLEND);
 }
 
-void drawTree(const Node *node, bool vertical, float height = 5.0f) {
+void drawTree(const Node *node, bool vertical, int &coneIndex,
+		const Pos &worldPos, float height = 5.0f) {
 
-	drawNode(node);
+	// Draw this node at its computed world position (after any parent spinning)
+	drawNodeAt(node, worldPos);
 
 	if (node->children.empty())
 		return;
 
-	float radius = (
-			proportional_layout ? (node->size - 1) : node->children.size())
+	float radius = (proportional_layout ? (node->size - 1) : node->children.size())
 			* 0.5f + 1.0f;
-	Pos base_center = node->pos;
-	if (vertical) {
-		base_center.y -= height;
-	} else {
-		base_center.x += height;
+
+	// Determine selection/spin for THIS cone
+	bool allSelected = (selectedConeIndex == -1);
+	bool thisConeSelected = allSelected || (coneIndex == selectedConeIndex);
+
+	float spinDeg = 0.0f;
+	if (animation_on) {
+		if (allSelected) {
+			spinDeg = coneSpinAllDeg;
+		} else if (thisConeSelected) {
+			spinDeg = coneSpinSingleDeg;
+		}
 	}
 
-	drawCone(node->pos, base_center, radius, height, vertical);
+	Pos base_center = worldPos;
+	if (vertical)
+		base_center.y -= height;
+	else
+		base_center.x += height;
 
+	drawCone(worldPos, base_center, radius, height, vertical, thisConeSelected, spinDeg);
+	coneIndex++;
+
+	// Rotate the entire subtree placement around this cone's axis so that
+	// spheres and labels move with the spinning cone.
 	for (auto child : node->children) {
 
-		drawTree(child, vertical, height);
+		// Child's layout offset relative to this node (layout space)
+		Pos rel;
+		rel.x = child->pos.x - node->pos.x;
+		rel.y = child->pos.y - node->pos.y;
+		rel.z = child->pos.z - node->pos.z;
+
+		// If this cone is spinning, rotate the offset around the cone axis
+		if (spinDeg != 0.0f) {
+			rel = rotateOffsetAroundConeAxis(rel, spinDeg, vertical);
+		}
+
+		Pos childWorld;
+		childWorld.x = worldPos.x + rel.x;
+		childWorld.y = worldPos.y + rel.y;
+		childWorld.z = worldPos.z + rel.z;
+
+		drawTree(child, vertical, coneIndex, childWorld, height);
 	}
 }
 
@@ -295,7 +396,9 @@ void display() {
 	glRotatef(rot_y, 0.0f, 1.0f, 0.0f);
 
 	if (root) {
-		drawTree(root, vertical_mode);
+		int coneIndex = 0;
+		drawTree(root, vertical_mode, coneIndex, root->pos);
+		totalCones = coneIndex;
 	}
 
 	glutSwapBuffers();
@@ -346,24 +449,54 @@ void motion(int mx, int my) {
 void keyboard(unsigned char key, int x, int y) {
 
 	switch (key) {
+	case 'c':
+	case 'C': {
+		// Cycle selection: ALL -> cone 0 -> cone 1 -> ... -> ALL
+		int cones = (totalCones > 0) ? totalCones : countCones(root);
+		if (cones <= 0)
+			break;
+
+		if (selectedConeIndex == -1) {
+			selectedConeIndex = 0;
+		} else if (selectedConeIndex < cones - 1) {
+			selectedConeIndex++;
+		} else {
+			selectedConeIndex = -1;
+		}
+		break;
+	}
 	case 'v':
 	case 'V':
 		vertical_mode = true;
 		layoutTree(root, vertical_mode, proportional_layout);
+		if (selectedConeIndex >= countCones(root))
+			selectedConeIndex = -1;
 		break;
 	case 'h':
 	case 'H':
 		vertical_mode = false;
 		layoutTree(root, vertical_mode, proportional_layout);
+		if (selectedConeIndex >= countCones(root))
+			selectedConeIndex = -1;
 		break;
 	case 'p':
 	case 'P':
 		proportional_layout = !proportional_layout;
 		layoutTree(root, vertical_mode, proportional_layout);
+		if (selectedConeIndex >= countCones(root))
+			selectedConeIndex = -1;
 		break;
 	case 'a':
 	case 'A':
 		animation_on = !animation_on;
+		break;
+	case '[':
+		// Slow down animation
+		animationSpeed = std::max(0.1f, animationSpeed * 0.8f);
+		break;
+	case ']':
+		// Speed up animation
+		animationSpeed = std::min(10.0f, animationSpeed * 1.25f);
 		break;
 	case 'f':
 	case 'F':
@@ -387,11 +520,25 @@ void keyboard(unsigned char key, int x, int y) {
 void timer(int value) {
 
 	if (animation_on) {
-		if (vertical_mode) {
-			rot_y += 1.0f;
+
+		if (selectedConeIndex == -1) {
+			// ALL selected: animate scene rotation + all cones
+			if (vertical_mode)
+				rot_y += 1.0f * animationSpeed;
+			else
+				rot_x += 1.0f * animationSpeed;
+
+			coneSpinAllDeg += 2.5f * animationSpeed;
+			if (coneSpinAllDeg >= 360.0f)
+				coneSpinAllDeg -= 360.0f;
+
 		} else {
-			rot_x += 1.0f;
+			// Single cone selected: animate ONLY that cone (no scene rotation)
+			coneSpinSingleDeg += 4.0f * animationSpeed;
+			if (coneSpinSingleDeg >= 360.0f)
+				coneSpinSingleDeg -= 360.0f;
 		}
+
 		glutPostRedisplay();
 	}
 	glutTimerFunc(20, timer, 0);
